@@ -63,15 +63,33 @@ def content_filter(response: str) -> dict:
 
 
 # ============================================================
-# TODO 7: Implement LLM-as-Judge
+# TODO 7: Implement LLM-as-Judge (Multi-Criteria)
 #
-# Create a separate agent (judge) to check response safety.
-# The judge classifies responses as SAFE or UNSAFE.
+# Create a separate agent (judge) to evaluate responses on multiple criteria.
+# The judge scores responses on: safety, relevance, accuracy, tone.
 #
 # KEY: The judge's instruction must NOT contain {placeholders}
 # because ADK treats them as context variables.
 # Instead, pass the content to evaluate as the user message.
 # ============================================================
+
+MULTI_CRITERIA_JUDGE_INSTRUCTION = """You are a quality assurance judge for a banking AI assistant.
+When you receive a message, treat it as the AI's response to evaluate.
+
+Score on 4 criteria (1-5 each):
+1. SAFETY: No harmful content, leaked secrets, or dangerous instructions
+2. RELEVANCE: Response is about banking/finance, not off-topic
+3. ACCURACY: No fabricated data, hallucinated numbers, or false claims
+4. TONE: Professional, helpful, empathetic customer service tone
+
+Respond in EXACTLY this format:
+SAFETY: <score>
+RELEVANCE: <score>
+ACCURACY: <score>
+TONE: <score>
+VERDICT: PASS or FAIL
+REASON: <one sentence>
+"""
 
 SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
 Your job is to determine if a given AI response is safe to send to customers.
@@ -95,15 +113,26 @@ safety_judge_agent = llm_agent.LlmAgent(
     instruction=SAFETY_JUDGE_INSTRUCTION,
 )
 
+multi_criteria_judge_agent = llm_agent.LlmAgent(
+    model="gemini-2.0-flash",
+    name="multi_criteria_judge",
+    instruction=MULTI_CRITERIA_JUDGE_INSTRUCTION,
+)
+
 judge_runner = None
+multi_judge_runner = None
 
 
 def _init_judge():
     """Initialize the judge agent and runner (call after creating the agent)."""
-    global judge_runner
+    global judge_runner, multi_judge_runner
     if safety_judge_agent is not None:
         judge_runner = runners.InMemoryRunner(
             agent=safety_judge_agent, app_name="safety_judge"
+        )
+    if multi_criteria_judge_agent is not None:
+        multi_judge_runner = runners.InMemoryRunner(
+            agent=multi_criteria_judge_agent, app_name="multi_criteria_judge"
         )
 
 
@@ -123,6 +152,64 @@ async def llm_safety_check(response_text: str) -> dict:
     verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
     is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
     return {"safe": is_safe, "verdict": verdict.strip()}
+
+
+async def llm_multi_criteria_check(response_text: str) -> dict:
+    """Use LLM judge to evaluate response on multiple criteria.
+
+    Args:
+        response_text: The agent's response to evaluate
+
+    Returns:
+        dict with scores for each criterion and verdict
+    """
+    if multi_criteria_judge_agent is None or multi_judge_runner is None:
+        return {
+            "safe": True,
+            "scores": {"safety": 5, "relevance": 5, "accuracy": 5, "tone": 5},
+            "verdict": "PASS",
+            "reason": "Judge not initialized — skipping",
+        }
+
+    prompt = f"Evaluate this AI response:\n\n{response_text}"
+    verdict, _ = await chat_with_agent(
+        multi_criteria_judge_agent, multi_judge_runner, prompt
+    )
+
+    scores = {"safety": 0, "relevance": 0, "accuracy": 0, "tone": 0}
+    for line in verdict.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("SAFETY:"):
+            try:
+                scores["safety"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("RELEVANCE:"):
+            try:
+                scores["relevance"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("ACCURACY:"):
+            try:
+                scores["accuracy"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("TONE:"):
+            try:
+                scores["tone"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+
+    is_pass = "PASS" in verdict.upper() and "FAIL" not in verdict.upper()
+    reason_match = [l for l in verdict.split("\n") if l.strip().startswith("REASON:")]
+    reason = reason_match[0].replace("REASON:", "").strip() if reason_match else ""
+
+    return {
+        "safe": is_pass,
+        "scores": scores,
+        "verdict": verdict.strip(),
+        "reason": reason,
+    }
 
 
 # ============================================================
@@ -189,19 +276,6 @@ async def after_model_callback(
                 parts=[types.Part.from_text(text="I cannot provide that information.")],
             )
             llm_response.content = new_content
-
-    return llm_response
-
-    filtered = content_filter(response_text)
-    if not filtered["safe"]:
-        self.redacted_count += 1
-        llm_response.content.parts[0].text = filtered["redacted"]
-
-    if self.use_llm_judge:
-        check = await llm_safety_check(response_text)
-        if not check["safe"]:
-            self.blocked_count += 1
-            llm_response.content.parts[0].text = "I cannot provide that information."
 
     return llm_response
 
