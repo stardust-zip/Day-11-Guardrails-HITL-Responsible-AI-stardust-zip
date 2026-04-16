@@ -4,6 +4,7 @@ Lab 11 — Part 2A: Input Guardrails
   TODO 4: Topic filter
   TODO 5: Input Guardrail Plugin (ADK)
 """
+
 import re
 
 from google.genai import types
@@ -28,6 +29,7 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 # - "act as (a |an )?unrestricted"
 # ============================================================
 
+
 def detect_injection(user_input: str) -> bool:
     """Detect prompt injection patterns in user input.
 
@@ -38,9 +40,12 @@ def detect_injection(user_input: str) -> bool:
         True if injection detected, False otherwise
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(all\s+)?(previous|above)\s+instructions",
+        r"you\s+are\s+now",
+        r"system\s+prompt",
+        r"reveal\s+(your\s+)?(instructions|prompt|config)",
+        r"pretend\s+you\s+are",
+        r"act\s+as\s+(a|an)?\s*unrestricted",
     ]
 
     for pattern in INJECTION_PATTERNS:
@@ -59,6 +64,7 @@ def detect_injection(user_input: str) -> bool:
 # Return True if input should be BLOCKED (off-topic or blocked topic).
 # ============================================================
 
+
 def topic_filter(user_input: str) -> bool:
     """Check if input is off-topic or contains blocked topics.
 
@@ -70,12 +76,15 @@ def topic_filter(user_input: str) -> bool:
     """
     input_lower = user_input.lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return True
-    # 2. If input doesn't contain any allowed topic -> return True
-    # 3. Otherwise -> return False (allow)
+    for blocked in BLOCKED_TOPICS:
+        if blocked in input_lower:
+            return True
 
-    pass  # Replace with your implementation
+    for allowed in ALLOWED_TOPICS:
+        if allowed in input_lower:
+            return False
+
+    return True
 
 
 # ============================================================
@@ -88,6 +97,7 @@ def topic_filter(user_input: str) -> bool:
 #   - user_message is types.Content (not str)
 #   - Return types.Content to block, or None to pass through
 # ============================================================
+
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
@@ -128,19 +138,25 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If True: increment blocked_count, return self._block_response("...")
-        # 3. If both are False: return None (let message through)
+        if detect_injection(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process this request. It appears to contain potential prompt injection."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text):
+            self.blocked_count += 1
+            return self._block_response(
+                "I can only help with banking-related questions. Please ask about accounts, transactions, loans, or other banking topics."
+            )
+
+        return None
 
 
 # ============================================================
 # Quick tests
 # ============================================================
+
 
 def test_injection_detection():
     """Test detect_injection with sample inputs."""
@@ -153,7 +169,9 @@ def test_injection_detection():
     for text, expected in test_cases:
         result = detect_injection(text)
         status = "PASS" if result == expected else "FAIL"
-        print(f"  [{status}] '{text[:55]}...' -> detected={result} (expected={expected})")
+        print(
+            f"  [{status}] '{text[:55]}...' -> detected={result} (expected={expected})"
+        )
 
 
 def test_topic_filter():
@@ -198,9 +216,11 @@ async def test_input_plugin():
 if __name__ == "__main__":
     import sys
     from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     test_injection_detection()
     test_topic_filter()
     import asyncio
+
     asyncio.run(test_input_plugin())

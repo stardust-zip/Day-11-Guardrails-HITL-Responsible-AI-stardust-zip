@@ -1,6 +1,7 @@
 """
 Lab 11 — Agent Creation (Unsafe & Protected)
 """
+
 from google.adk.agents import llm_agent
 from google.adk import runners
 
@@ -27,12 +28,14 @@ def create_unsafe_agent():
     return agent, runner
 
 
-def create_protected_agent(plugins: list):
+def create_protected_agent(plugins: list = None):
     """Create a banking agent WITH guardrail plugins.
 
     Args:
-        plugins: List of BasePlugin instances (input + output guardrails)
+        plugins: List of BasePlugin instances (input + output guardrails). Optional.
     """
+    if plugins is None:
+        plugins = []
     agent = llm_agent.LlmAgent(
         model="gemini-2.5-flash-lite",
         name="protected_assistant",
@@ -52,8 +55,7 @@ def create_protected_agent(plugins: list):
 async def test_agent(agent, runner):
     """Quick sanity check — send a normal question."""
     response, _ = await chat_with_agent(
-        agent, runner,
-        "Hi, I'd like to ask about the current savings interest rate?"
+        agent, runner, "Hi, I'd like to ask about the current savings interest rate?"
     )
     print(f"User: Hi, I'd like to ask about the savings interest rate?")
     print(f"Agent: {response}")
