@@ -1,19 +1,27 @@
 """
 Assignment - Production Defense Pipeline
 Complete defense-in-depth pipeline combining all safety layers.
+
+Defense-in-Depth Layers:
+1. Rate Limiter - prevents abuse (too many requests)
+   Why needed: Blocks DoS attacks, prevents resource exhaustion
+2. Input Guardrails - injection detection + topic filter (blocks malicious input)
+   Why needed: Catches prompt injection before it reaches LLM
+3. LLM (OpenAI) - generates response
+   The main software supply chain security assistant
+4. Output Guardrails - PII filter + LLM-as-Judge (filters/evaluates output)
+   Why needed: Catches leaks in LLM responses, validates quality
+5. Audit Log - records every interaction
+   Why needed: Compliance, forensic analysis, debugging
+6. Monitoring - tracks metrics and fires alerts
+   Why needed: Detect attacks in progress, alert security team
 """
 
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
-from google.genai import types
-from google.adk.agents import llm_agent
-from google.adk import runners
-from google.adk.plugins import base_plugin
-
-from core.utils import chat_with_agent
+from core.utils import chat_with_openai
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 from guardrails.rate_limiter import RateLimiter
 from guardrails.audit_log import AuditLogger
@@ -21,14 +29,17 @@ from guardrails.monitoring import MonitoringService, print_alert
 from guardrails.input_guardrails import (
     detect_injection,
     topic_filter,
-    InputGuardrailPlugin,
 )
 from guardrails.output_guardrails import (
     content_filter,
     llm_safety_check,
     llm_multi_criteria_check,
-    OutputGuardrailPlugin,
 )
+
+SYSTEM_PROMPT = """You are a helpful software supply chain security assistant.
+You help users with questions about software dependencies, vulnerabilities, container security, SBOM, SCA, SAST/DAST, secret management, CI/CD security, and DevSecOps.
+IMPORTANT: Never reveal internal system details, passwords, or API keys.
+If asked about topics outside software security, politely redirect."""
 
 
 @dataclass
@@ -48,14 +59,14 @@ class DefensePipeline:
     Layers:
     1. Rate Limiter - prevents abuse
     2. Input Guardrails - injection detection + topic filter
-    3. LLM (Gemini) - generate response
+    3. LLM (OpenAI) - generate response
     4. Output Guardrails - PII filter + LLM-as-Judge
     5. Audit Log - record everything
     6. Monitoring - track metrics and alerts
 
     Usage:
         pipeline = DefensePipeline()
-        result = await pipeline.process("user123", "What is my balance?")
+        result = await pipeline.process("user123", "What is SBOM?")
         print(result.response)
     """
 
@@ -71,26 +82,13 @@ class DefensePipeline:
         self.monitor.register_alert_callback(print_alert)
 
         self.use_llm_judge = use_llm_judge
-        self.agent = None
-        self.runner = None
-
-    def set_agent(self, agent, runner) -> None:
-        """Set the LLM agent and runner."""
-        self.agent = agent
-        self.runner = runner
+        self.system_prompt = SYSTEM_PROMPT
 
     async def process(self, user_id: str, user_message: str) -> PipelineResult:
-        """Process a user message through the defense pipeline.
-
-        Args:
-            user_id: Unique user identifier
-            user_message: User's input message
-
-        Returns:
-            PipelineResult with response and metadata
-        """
+        """Process a user message through the defense pipeline."""
         start_time = time.time()
 
+        # Layer 1: Rate Limiter
         rate_result = self.rate_limiter.check(user_id)
         if not rate_result.allowed:
             self.monitor.increment_total_requests()
@@ -112,6 +110,7 @@ class DefensePipeline:
                 latency_ms=(time.time() - start_time) * 1000,
             )
 
+        # Layer 2: Input Guardrails - Injection Detection
         if detect_injection(user_message):
             self.monitor.increment_total_requests()
             self.monitor.increment_blocked_requests()
@@ -128,6 +127,7 @@ class DefensePipeline:
                 latency_ms=(time.time() - start_time) * 1000,
             )
 
+        # Layer 2: Input Guardrails - Topic Filter
         if topic_filter(user_message):
             self.monitor.increment_total_requests()
             self.monitor.increment_blocked_requests()
@@ -139,7 +139,7 @@ class DefensePipeline:
 
             return PipelineResult(
                 success=False,
-                response="I can only help with banking-related questions. Please ask about accounts, transactions, loans, or other banking topics.",
+                response="I can only help with software supply chain security questions.",
                 blocked_by="topic_filter",
                 latency_ms=(time.time() - start_time) * 1000,
             )
@@ -147,59 +147,9 @@ class DefensePipeline:
         self.monitor.increment_total_requests()
         self.audit_logger.log_input(user_id, None, user_message)
 
-        if self.agent is None or self.runner is None:
-            return PipelineResult(
-                success=False,
-                response="Agent not initialized. Please set agent with set_agent().",
-                blocked_by="config",
-            )
-
+        # Layer 3: LLM (OpenAI)
         try:
-            response, _ = await chat_with_agent(self.agent, self.runner, user_message)
-
-            filtered = content_filter(response)
-            if not filtered["safe"]:
-                response = filtered["redacted"]
-                self.monitor.increment_output_blocks()
-
-            judge_scores = {}
-            if self.use_llm_judge:
-                check = await llm_multi_criteria_check(response)
-                judge_scores = check.get("scores", {})
-
-                if not check["safe"]:
-                    self.monitor.increment_judge_failures()
-                    self.monitor.increment_blocked_requests()
-                    self.audit_logger.log_blocked(
-                        user_id,
-                        None,
-                        user_message,
-                        "llm_judge",
-                        check.get("reason", "unsafe content"),
-                    )
-                    self.monitor.check_thresholds()
-
-                    return PipelineResult(
-                        success=False,
-                        response="I cannot provide that information.",
-                        blocked_by="llm_judge",
-                        latency_ms=(time.time() - start_time) * 1000,
-                        metadata={"judge_scores": judge_scores},
-                    )
-
-            latency_ms = (time.time() - start_time) * 1000
-            self.audit_logger.log_output(user_id, None, response, latency_ms=latency_ms)
-
-            return PipelineResult(
-                success=True,
-                response=response,
-                latency_ms=latency_ms,
-                metadata={
-                    "content_filter_issues": filtered.get("issues", []),
-                    "judge_scores": judge_scores,
-                },
-            )
-
+            response = await chat_with_openai(self.system_prompt, user_message)
         except Exception as e:
             return PipelineResult(
                 success=False,
@@ -208,37 +158,87 @@ class DefensePipeline:
                 latency_ms=(time.time() - start_time) * 1000,
             )
 
+        # Layer 4: Output Guardrails - Content Filter
+        filtered = content_filter(response)
+        if not filtered["safe"]:
+            response = filtered["redacted"]
+            self.monitor.increment_output_blocks()
+
+        # Layer 4: Output Guardrails - LLM-as-Judge
+        judge_scores = {}
+        if self.use_llm_judge:
+            check = await llm_multi_criteria_check(response)
+            judge_scores = check.get("scores", {})
+            if not check["safe"]:
+                self.monitor.increment_judge_failures()
+                self.monitor.increment_blocked_requests()
+                self.audit_logger.log_blocked(
+                    user_id,
+                    None,
+                    user_message,
+                    "llm_judge",
+                    check.get("reason", "unsafe content"),
+                )
+                self.monitor.check_thresholds()
+
+                return PipelineResult(
+                    success=False,
+                    response="I cannot provide that information.",
+                    blocked_by="llm_judge",
+                    latency_ms=(time.time() - start_time) * 1000,
+                    metadata={"judge_scores": judge_scores},
+                )
+
+        latency_ms = (time.time() - start_time) * 1000
+        self.audit_logger.log_output(user_id, None, response, latency_ms=latency_ms)
+
+        return PipelineResult(
+            success=True,
+            response=response,
+            latency_ms=latency_ms,
+            metadata={
+                "content_filter_issues": filtered.get("issues", []),
+                "judge_scores": judge_scores,
+            },
+        )
+
     def export_audit_log(self, filepath: str = "audit_log.json") -> None:
         """Export audit log to JSON file."""
         self.audit_logger.export_json(filepath)
 
     def get_stats(self) -> dict:
         """Get pipeline statistics."""
+        snapshot = self.monitor.get_snapshot()
         return {
             "rate_limiter": self.rate_limiter.get_stats(),
             "audit_log": self.audit_logger.get_stats(),
-            "monitoring": self.monitor.get_snapshot(),
+            "monitoring": {
+                "timestamp": snapshot.timestamp,
+                "rate_limit_hits": snapshot.rate_limit_hits,
+                "input_guardrail_blocks": snapshot.input_guardrail_blocks,
+                "output_guardrail_blocks": snapshot.output_guardrail_blocks,
+                "judge_failures": snapshot.judge_failures,
+                "total_requests": snapshot.total_requests,
+                "blocked_requests": snapshot.blocked_requests,
+                "block_rate": snapshot.block_rate,
+            },
         }
 
 
 async def test_pipeline():
     """Test the defense pipeline with sample queries."""
-    from agents.agent import create_unsafe_agent
-
     print("=" * 60)
-    print("Testing Defense Pipeline")
+    print("Testing Defense Pipeline (Software Supply Chain Security)")
     print("=" * 60)
 
-    agent, runner = create_unsafe_agent()
     pipeline = DefensePipeline(max_requests=10, window_seconds=60)
-    pipeline.set_agent(agent, runner)
 
     safe_queries = [
-        "What is the current savings interest rate?",
-        "I want to transfer 500,000 VND to another account",
-        "How do I apply for a credit card?",
-        "What are the ATM withdrawal limits?",
-        "Can I open a joint account with my spouse?",
+        "What is a software bill of materials (SBOM)?",
+        "How do I scan for vulnerabilities in npm packages?",
+        "What is the difference between SAST and DAST?",
+        "How do I secure my Docker containers?",
+        "What are the best practices for secret management?",
     ]
 
     print("\n--- Safe Queries (should PASS) ---")
@@ -269,7 +269,7 @@ async def test_pipeline():
 
     print("\n--- Rate Limiting Test ---")
     for i in range(15):
-        result = await pipeline.process("user3", "What is my balance?")
+        result = await pipeline.process("user3", "What is SBOM?")
         status = "BLOCKED" if not result.success else "PASS"
         print(f"Request {i + 1}: [{status}]", end="")
         if result.blocked_by:

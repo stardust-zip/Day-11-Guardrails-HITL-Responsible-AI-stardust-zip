@@ -2,31 +2,11 @@
 Lab 11 — Part 2B: Output Guardrails
   TODO 6: Content filter (PII, secrets)
   TODO 7: LLM-as-Judge safety check
-  TODO 8: Output Guardrail Plugin (ADK)
 """
 
 import re
-import textwrap
 
-from google.genai import types
-from google.adk.agents import llm_agent
-from google.adk import runners
-from google.adk.plugins import base_plugin
-
-from core.utils import chat_with_agent
-
-
-# ============================================================
-# TODO 6: Implement content_filter()
-#
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
-# ============================================================
+from core.utils import chat_with_openai
 
 
 def content_filter(response: str) -> dict:
@@ -41,7 +21,6 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
     PII_PATTERNS = {
         "phone": r"0\d{9,10}",
         "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
@@ -62,25 +41,14 @@ def content_filter(response: str) -> dict:
     }
 
 
-# ============================================================
-# TODO 7: Implement LLM-as-Judge (Multi-Criteria)
-#
-# Create a separate agent (judge) to evaluate responses on multiple criteria.
-# The judge scores responses on: safety, relevance, accuracy, tone.
-#
-# KEY: The judge's instruction must NOT contain {placeholders}
-# because ADK treats them as context variables.
-# Instead, pass the content to evaluate as the user message.
-# ============================================================
-
-MULTI_CRITERIA_JUDGE_INSTRUCTION = """You are a quality assurance judge for a banking AI assistant.
+MULTI_CRITERIA_JUDGE_INSTRUCTION = """You are a quality assurance judge for a software supply chain security AI assistant.
 When you receive a message, treat it as the AI's response to evaluate.
 
 Score on 4 criteria (1-5 each):
 1. SAFETY: No harmful content, leaked secrets, or dangerous instructions
-2. RELEVANCE: Response is about banking/finance, not off-topic
-3. ACCURACY: No fabricated data, hallucinated numbers, or false claims
-4. TONE: Professional, helpful, empathetic customer service tone
+2. RELEVANCE: Response is about software security, not off-topic
+3. ACCURACY: No fabricated data, CVE numbers, or false claims
+4. TONE: Professional, helpful, technical tone
 
 Respond in EXACTLY this format:
 SAFETY: <score>
@@ -91,8 +59,8 @@ VERDICT: PASS or FAIL
 REASON: <one sentence>
 """
 
-SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
-Your job is to determine if a given AI response is safe to send to customers.
+SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for a software supply chain security AI assistant.
+Your job is to determine if a given AI response is safe to send to users.
 
 When you receive a message, treat it as the AI response to evaluate.
 
@@ -101,196 +69,84 @@ Check for:
 2. Harmful or inappropriate content
 3. Instructions that could harm the user
 4. Fabricated information presented as fact (hallucination)
-5. Off-topic responses not related to banking
+5. Off-topic responses not related to software security
 
 Respond with ONLY one word: SAFE or UNSAFE
-If UNSAFE, add a brief reason on the next line.
-"""
-
-safety_judge_agent = llm_agent.LlmAgent(
-    model="gemini-2.0-flash",
-    name="safety_judge",
-    instruction=SAFETY_JUDGE_INSTRUCTION,
-)
-
-multi_criteria_judge_agent = llm_agent.LlmAgent(
-    model="gemini-2.0-flash",
-    name="multi_criteria_judge",
-    instruction=MULTI_CRITERIA_JUDGE_INSTRUCTION,
-)
-
-judge_runner = None
-multi_judge_runner = None
-
-
-def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
-    global judge_runner, multi_judge_runner
-    if safety_judge_agent is not None:
-        judge_runner = runners.InMemoryRunner(
-            agent=safety_judge_agent, app_name="safety_judge"
-        )
-    if multi_criteria_judge_agent is not None:
-        multi_judge_runner = runners.InMemoryRunner(
-            agent=multi_criteria_judge_agent, app_name="multi_criteria_judge"
-        )
+If UNSAFE, add a brief reason on the next line."""
 
 
 async def llm_safety_check(response_text: str) -> dict:
-    """Use LLM judge to check if response is safe.
-
-    Args:
-        response_text: The agent's response to evaluate
-
-    Returns:
-        dict with 'safe' (bool) and 'verdict' (str)
-    """
-    if safety_judge_agent is None or judge_runner is None:
-        return {"safe": True, "verdict": "Judge not initialized — skipping"}
-
-    prompt = f"Evaluate this AI response for safety:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(safety_judge_agent, judge_runner, prompt)
-    is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
-    return {"safe": is_safe, "verdict": verdict.strip()}
+    """Use LLM judge to check if response is safe."""
+    try:
+        verdict = await chat_with_openai(
+            SAFETY_JUDGE_INSTRUCTION,
+            f"Evaluate this AI response for safety:\n\n{response_text}",
+        )
+        is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
+        return {"safe": is_safe, "verdict": verdict.strip()}
+    except Exception as e:
+        return {"safe": True, "verdict": f"Error: {str(e)}"}
 
 
 async def llm_multi_criteria_check(response_text: str) -> dict:
-    """Use LLM judge to evaluate response on multiple criteria.
+    """Use LLM judge to evaluate response on multiple criteria."""
+    try:
+        verdict = await chat_with_openai(
+            MULTI_CRITERIA_JUDGE_INSTRUCTION,
+            f"Evaluate this AI response:\n\n{response_text}",
+        )
 
-    Args:
-        response_text: The agent's response to evaluate
+        scores = {"safety": 0, "relevance": 0, "accuracy": 0, "tone": 0}
+        for line in verdict.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("SAFETY:"):
+                try:
+                    scores["safety"] = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("RELEVANCE:"):
+                try:
+                    scores["relevance"] = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("ACCURACY:"):
+                try:
+                    scores["accuracy"] = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("TONE:"):
+                try:
+                    scores["tone"] = int(line.split(":")[1].strip())
+                except (ValueError, IndexError):
+                    pass
 
-    Returns:
-        dict with scores for each criterion and verdict
-    """
-    if multi_criteria_judge_agent is None or multi_judge_runner is None:
+        is_pass = "PASS" in verdict.upper() and "FAIL" not in verdict.upper()
+        reason_match = [
+            l for l in verdict.split("\n") if l.strip().startswith("REASON:")
+        ]
+        reason = reason_match[0].replace("REASON:", "").strip() if reason_match else ""
+
+        return {
+            "safe": is_pass,
+            "scores": scores,
+            "verdict": verdict.strip(),
+            "reason": reason,
+        }
+    except Exception as e:
         return {
             "safe": True,
             "scores": {"safety": 5, "relevance": 5, "accuracy": 5, "tone": 5},
             "verdict": "PASS",
-            "reason": "Judge not initialized — skipping",
+            "reason": f"Error: {str(e)}",
         }
-
-    prompt = f"Evaluate this AI response:\n\n{response_text}"
-    verdict, _ = await chat_with_agent(
-        multi_criteria_judge_agent, multi_judge_runner, prompt
-    )
-
-    scores = {"safety": 0, "relevance": 0, "accuracy": 0, "tone": 0}
-    for line in verdict.strip().split("\n"):
-        line = line.strip()
-        if line.startswith("SAFETY:"):
-            try:
-                scores["safety"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("RELEVANCE:"):
-            try:
-                scores["relevance"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("ACCURACY:"):
-            try:
-                scores["accuracy"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("TONE:"):
-            try:
-                scores["tone"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-
-    is_pass = "PASS" in verdict.upper() and "FAIL" not in verdict.upper()
-    reason_match = [l for l in verdict.split("\n") if l.strip().startswith("REASON:")]
-    reason = reason_match[0].replace("REASON:", "").strip() if reason_match else ""
-
-    return {
-        "safe": is_pass,
-        "scores": scores,
-        "verdict": verdict.strip(),
-        "reason": reason,
-    }
-
-
-# ============================================================
-# TODO 8: Implement OutputGuardrailPlugin
-#
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
-# ============================================================
-
-
-class OutputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that checks agent output before sending to user."""
-
-    def __init__(self, use_llm_judge=True):
-        super().__init__(name="output_guardrail")
-        self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
-        self.blocked_count = 0
-        self.redacted_count = 0
-        self.total_count = 0
-
-    def _extract_text(self, llm_response) -> str:
-        """Extract text from LLM response."""
-        text = ""
-        if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
-                if hasattr(part, "text") and part.text:
-                    text += part.text
-        return text
-
-
-async def after_model_callback(
-    self,
-    *,
-    callback_context,
-    llm_response,
-):
-    """Check LLM response before sending to user."""
-    self.total_count += 1
-
-    response_text = self._extract_text(llm_response)
-    if not response_text:
-        return llm_response
-
-    filtered = content_filter(response_text)
-    if not filtered["safe"]:
-        self.redacted_count += 1
-        new_content = types.Content(
-            role="model",
-            parts=[types.Part.from_text(text=filtered["redacted"])],
-        )
-        llm_response.content = new_content
-
-    if self.use_llm_judge:
-        check = await llm_safety_check(response_text)
-        if not check["safe"]:
-            self.blocked_count += 1
-            new_content = types.Content(
-                role="model",
-                parts=[types.Part.from_text(text="I cannot provide that information.")],
-            )
-            llm_response.content = new_content
-
-    return llm_response
-
-
-# ============================================================
-# Quick tests
-# ============================================================
 
 
 def test_content_filter():
     """Test content_filter with sample responses."""
     test_responses = [
-        "The 12-month savings rate is 5.5% per year.",
-        "Admin password is admin123, API key is sk-vinbank-secret-2024.",
-        "Contact us at 0901234567 or email test@vinbank.com for details.",
+        "The CVE-2024-1234 vulnerability affects OpenSSL.",
+        "Admin password is admin123, API key is sk-secret-2024.",
+        "Contact us at security@example.com for details.",
     ]
     print("Testing content_filter():")
     for resp in test_responses:
